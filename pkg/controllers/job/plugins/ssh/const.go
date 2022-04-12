@@ -26,11 +26,15 @@ const (
 	// SSHAuthorizedKeys authkey
 	SSHAuthorizedKeys = "authorized_keys"
 
-	// SSHConfig  ssh conf
+	// SSHConfig ssh conf
 	SSHConfig = "config"
 
-	// SSHAbsolutePath ssh abs path
-	SSHAbsolutePath = "/root/.ssh"
+	// SSHAbsolutePathLinux ssh abs path in linux container
+	SSHAbsolutePathLinux = "/root/.ssh"
+
+	// SSHAbsolutePathWin ssh abs path in windows container
+	SSHAbsolutePathWin = "C:\\Users\\ContainerAdministrator\\.ssh"
+
 
 	// SSHRelativePath ssh rel path
 	SSHRelativePath = ".ssh"

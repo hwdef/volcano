@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"runtime"
 
 	"golang.org/x/crypto/ssh"
 	v1 "k8s.io/api/core/v1"
@@ -55,7 +56,11 @@ func New(client pluginsinterface.PluginClientset, arguments []string) pluginsint
 	p := sshPlugin{
 		pluginArguments: arguments,
 		client:          client,
-		sshKeyFilePath:  SSHAbsolutePath,
+		sshKeyFilePath:  SSHAbsolutePathLinux,
+	}
+
+	if runtime.GOOS == "windows" {
+		p.sshKeyFilePath = SSHAbsolutePathWin
 	}
 
 	p.addFlags()
@@ -159,7 +164,7 @@ func (sp *sshPlugin) mountRsaKey(pod *v1.Pod, job *batch.Job) {
 		DefaultMode: &mode,
 	}
 
-	if sp.sshKeyFilePath != SSHAbsolutePath {
+	if sp.sshKeyFilePath != SSHAbsolutePathLinux && sp.sshKeyFilePath != SSHAbsolutePathWin {
 		var noRootMode int32 = 0644
 		sshVolume.Secret.DefaultMode = &noRootMode
 	}
