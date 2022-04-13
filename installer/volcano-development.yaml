@@ -130,6 +130,8 @@ spec:
       labels:
         app: volcano-admission
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       serviceAccount: volcano-admission
       containers:
         - args:
@@ -143,8 +145,8 @@ spec:
             - --port=8443
             - -v=4
             - 2>&1
-          image: volcanosh/vc-webhook-manager:latest
-          imagePullPolicy: IfNotPresent
+          image: bocloud-bj.io:5000/vc-webhook-manager:v1.5.1-1
+          imagePullPolicy: Always
           name: admission
           volumeMounts:
             - mountPath: /admission.local.config/certificates
@@ -173,6 +175,8 @@ spec:
   backoffLimit: 3
   template:
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       serviceAccountName: volcano-admission
       restartPolicy: Never
       containers:
@@ -8472,16 +8476,18 @@ spec:
       labels:
         app: volcano-controller
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       serviceAccount: volcano-controllers
       containers:
           - name: volcano-controllers
-            image: volcanosh/vc-controller-manager:latest
+            image: bocloud-bj.io:5000/vc-controller-manager:v1.5.1-1
             args:
               - --logtostderr
               - --enable-healthz=true
               - -v=4
               - 2>&1
-            imagePullPolicy: "IfNotPresent"
+            imagePullPolicy: "Always"
 ---
 # Source: volcano/templates/scheduler.yaml
 apiVersion: v1
@@ -8624,10 +8630,12 @@ spec:
       labels:
         app: volcano-scheduler
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       serviceAccount: volcano-scheduler
       containers:
         - name: volcano-scheduler
-          image: volcanosh/vc-scheduler:latest
+          image: bocloud-bj.io:5000/vc-scheduler:v1.5.1-1
           args:
             - --logtostderr
             - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
@@ -8635,7 +8643,7 @@ spec:
             - --enable-metrics=true
             - -v=3
             - 2>&1
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: "Always"
           volumeMounts:
             - name: scheduler-config
               mountPath: /volcano.scheduler

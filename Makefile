@@ -15,7 +15,7 @@
 BIN_DIR=_output/bin
 RELEASE_DIR=_output/release
 REPO_PATH=volcano.sh/volcano
-IMAGE_PREFIX=volcanosh/vc
+IMAGE_PREFIX=bocloud-bj.io:5000/vc
 CRD_OPTIONS ?= "crd:crdVersions=v1,generateEmbeddedObjectMeta=true"
 CC ?= "gcc"
 SUPPORT_PLUGINS ?= "no"
@@ -92,6 +92,7 @@ images: image_bins
 		cp ${BIN_DIR}/${REL_OSARCH}/vc-$$name ./installer/dockerfile/$$name/;\
 		if [ ${REL_OSARCH} = linux/amd64 ];then\
 			docker build --no-cache -t $(IMAGE_PREFIX)-$$name:$(TAG) ./installer/dockerfile/$$name;\
+			docker push $(IMAGE_PREFIX)-$$name:$(TAG) ;\
 		elif [ ${REL_OSARCH} = linux/arm64 ];then\
 			docker build --no-cache -t $(IMAGE_PREFIX)-$$name-arm64:$(TAG) -f ./installer/dockerfile/$$name/Dockerfile.arm64 ./installer/dockerfile/$$name;\
 		else\
