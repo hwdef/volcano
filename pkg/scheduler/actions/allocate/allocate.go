@@ -123,106 +123,187 @@ func (alloc *Action) pickUpQueuesAndJobs(queues *util.PriorityQueue, jobsMap map
 // 1. picks up tasks.
 // 2. allocates resources to these tasks. (this step is carried out by the allocateResourcesForTasks method.)
 func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[api.QueueID]*util.PriorityQueue) {
-	ssn := alloc.session
-	pendingTasks := map[api.JobID]*util.PriorityQueue{}
+    ssn := alloc.session
+    pendingTasks := map[api.JobID]*util.PriorityQueue{}
+    
+    allNodes := ssn.NodeList
 
-	allNodes := ssn.NodeList
+    // To pick <namespace, queue> tuple for job, we choose to pick namespace firstly.
+    // Because we believe that number of queues would less than namespaces in most case.
+    // And, this action would make the resource usage among namespace balanced.
+    for {
+        if queues.Empty() {
+            break
+        }
 
-	// To pick <namespace, queue> tuple for job, we choose to pick namespace firstly.
-	// Because we believe that number of queues would less than namespaces in most case.
-	// And, this action would make the resource usage among namespace balanced.
-	for {
-		if queues.Empty() {
-			break
-		}
+        queue := queues.Pop().(*api.QueueInfo)
 
-		queue := queues.Pop().(*api.QueueInfo)
+        if ssn.Overused(queue) {
+            klog.V(3).Infof("Queue <%s> is overused, ignore it.", queue.Name)
+            continue
+        }
 
-		if ssn.Overused(queue) {
-			klog.V(3).Infof("Queue <%s> is overused, ignore it.", queue.Name)
-			continue
-		}
+        klog.V(3).Infof("Try to allocate resource to Jobs in Queue <%s>", queue.Name)
 
-		klog.V(3).Infof("Try to allocate resource to Jobs in Queue <%s>", queue.Name)
+        jobs, found := jobsMap[queue.UID]
+        if !found || jobs.Empty() {
+            klog.V(4).Infof("Can not find jobs for queue %s.", queue.Name)
+            continue
+        }
 
-		jobs, found := jobsMap[queue.UID]
-		if !found || jobs.Empty() {
-			klog.V(4).Infof("Can not find jobs for queue %s.", queue.Name)
-			continue
-		}
+        job := jobs.Pop().(*api.JobInfo)
+        if _, found = pendingTasks[job.UID]; !found {
+            tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+            // 创建任务拓扑分组
+            topologyTaskGroups := make(map[string]*util.PriorityQueue)
+            
+            for _, task := range job.TaskStatusIndex[api.Pending] {
+                // Skip tasks whose pod are scheduling gated
+                if task.SchGated {
+                    continue
+                }
 
-		job := jobs.Pop().(*api.JobInfo)
-		if _, found = pendingTasks[job.UID]; !found {
-			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
-			for _, task := range job.TaskStatusIndex[api.Pending] {
-				// Skip tasks whose pod are scheduling gated
-				if task.SchGated {
-					continue
-				}
+                // Skip BestEffort task in 'allocate' action.
+                if task.Resreq.IsEmpty() {
+                    klog.V(4).Infof("Task <%v/%v> is BestEffort task, skip it.",
+                        task.Namespace, task.Name)
+                    continue
+                }
+                
+                // 处理有特定拓扑要求的任务
+                if task.TaskTopologyHyperNode != "" {
+                    if _, ok := topologyTaskGroups[task.TaskTopologyHyperNode]; !ok {
+                        topologyTaskGroups[task.TaskTopologyHyperNode] = util.NewPriorityQueue(ssn.TaskOrderFn)
+                    }
+                    topologyTaskGroups[task.TaskTopologyHyperNode].Push(task)
+                } else {
+                    // 无特定拓扑要求的任务放入通用队列
+                    tasks.Push(task)
+                }
+            }
+            
+            // 存储所有任务队列
+            pendingTasks[job.UID] = tasks
+            // 给job添加拓扑任务分组
+            job.TopologyTaskGroups = topologyTaskGroups
+        }
+        
+        tasks := pendingTasks[job.UID]
+        topologyTaskGroups := job.TopologyTaskGroups
 
-				// Skip BestEffort task in 'allocate' action.
-				if task.Resreq.IsEmpty() {
-					klog.V(4).Infof("Task <%v/%v> is BestEffort task, skip it.",
-						task.Namespace, task.Name)
-					continue
-				}
+        if tasks.Empty() && len(topologyTaskGroups) == 0 {
+            // put queue back again and try other jobs in this queue
+            queues.Push(queue)
+            continue
+        }
 
-				tasks.Push(task)
-			}
-			pendingTasks[job.UID] = tasks
-		}
-		tasks := pendingTasks[job.UID]
+        klog.V(3).Infof("Try to allocate resource to Job <%v/%v>", job.Namespace, job.Name)
+        
+        // 处理通用任务（无特定拓扑要求）
+        if !tasks.Empty() {
+            klog.V(3).Infof("Try to allocate resource to %d general tasks of Job <%v/%v>",
+                tasks.Len(), job.Namespace, job.Name)
+                
+            hardMode, highestAllowedTier := job.IsHardTopologyMode()
+            var stmt *framework.Statement
+            var tasksQueue *util.PriorityQueue
+            
+            if hardMode {
+                if !alloc.session.HyperNodesReadyToSchedule {
+                    klog.ErrorS(nil, "RealNodesList not completely populated and not ready to schedule, please check logs for more details", "job", job.UID)
+                    continue
+                }
+                stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier)
+                // There are still left tasks that need to be allocated when min available < replicas, put the job back and set pending tasks.
+                if tasksQueue != nil {
+                    pendingTasks[job.UID] = tasksQueue
+                }
+            } else {
+                stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "")
+                // There are still left tasks that need to be allocated when min available < replicas
+                if tasks.Len() > 0 {
+                    pendingTasks[job.UID] = tasks
+                }
+            }
 
-		if tasks.Empty() {
-			// put queue back again and try other jobs in this queue
-			queues.Push(queue)
-			continue
-		}
+            if stmt != nil {
+                stmt.Commit()
+            }
+        }
+        
+        // 处理具有特定拓扑要求的任务
+        for hyperNodeName, taskQueue := range topologyTaskGroups {
+            if taskQueue.Empty() {
+                continue
+            }
+            
+            klog.V(3).Infof("Try to allocate resource to %d topology-specific tasks for hyperNode %s of Job <%v/%v>",
+                taskQueue.Len(), hyperNodeName, job.Namespace, job.Name)
+                
+            // 获取指定hyperNode的节点列表
+            nodes, ok := ssn.RealNodesList[hyperNodeName]
+            if !ok {
+                klog.ErrorS(nil, "HyperNode not exists for topology-specific tasks", "jobName", job.UID, "name", hyperNodeName)
+                continue
+            }
+            
+            stmt := alloc.allocateResourcesForTasks(taskQueue, job, queue, nodes, hyperNodeName)
+            
+            if stmt != nil {
+                stmt.Commit()
+            }
+            
+            // 如果还有未分配的任务，保留队列
+            if taskQueue.Len() > 0 {
+                topologyTaskGroups[hyperNodeName] = taskQueue
+            } else {
+                delete(topologyTaskGroups, hyperNodeName)
+            }
+        }
+        
+        // 检查是否所有任务都已分配完毕
+        allTasksProcessed := tasks.Empty() && len(topologyTaskGroups) == 0
+        
+        // 如果还有未分配的任务，把作业放回队列
+        if !allTasksProcessed {
+            jobs.Push(job)
+        }
 
-		klog.V(3).Infof("Try to allocate resource to %d tasks of Job <%v/%v>",
-			tasks.Len(), job.Namespace, job.Name)
-
-		hardMode, highestAllowedTier := job.IsHardTopologyMode()
-		var stmt *framework.Statement
-		var tasksQueue *util.PriorityQueue
-		if hardMode {
-			if !alloc.session.HyperNodesReadyToSchedule {
-				klog.ErrorS(nil, "RealNodesList not completely populated and not ready to schedule, please check logs for more details", "job", job.UID)
-				continue
-			}
-			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier)
-			// There are still left tasks that need to be allocated when min available < replicas, put the job back and set pending tasks.
-			if tasksQueue != nil {
-				jobs.Push(job)
-				pendingTasks[job.UID] = tasksQueue
-			}
-		} else {
-			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "")
-			// There are still left tasks that need to be allocated when min available < replicas, put the job back
-			if tasks.Len() > 0 {
-				jobs.Push(job)
-			}
-		}
-
-		if stmt != nil {
-			stmt.Commit()
-		}
-
-		// Put back the queue to priority queue after job's resource allocating finished,
-		// To ensure that the priority of the queue is calculated based on the latest resource allocation situation.
-		queues.Push(queue)
-	}
+        // Put back the queue to priority queue after job's resource allocating finished,
+        // To ensure that the priority of the queue is calculated based on the latest resource allocation situation.
+        queues.Push(queue)
+    }
 }
 
 func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int) (*framework.Statement, *util.PriorityQueue) {
-	jobStmtsByTier := make(map[int]map[string]*framework.Statement)
-	hyperNodesWithLeftTasks := make(map[string]*util.PriorityQueue)
-	ssn := alloc.session
-	selectedTier := 0
-	LCAHyperNodeMap := map[string]string{}
-	jobAllocatedHyperNode := job.PodGroup.Annotations[api.JobAllocatedHyperNode]
+    // 检查是否有任务具有自己的拓扑设置
+    hasTaskTopology := false
+    tasksClone := tasks.Clone()
+    for !tasksClone.Empty() {
+        task := tasksClone.Pop().(*api.TaskInfo)
+        if task.TaskTopologyMode != "" {
+            hasTaskTopology = true
+            break
+        }
+    }
+    
+    // 如果任务有自己的拓扑设置，使用任务级别的拓扑逻辑
+    if hasTaskTopology {
+        // 我们已经在allocateResources中实现了针对每个任务的拓扑处理
+        // 这里只需返回原始任务队列，让任务级处理逻辑接管
+        return nil, tasks
+    }
+    
+    // 否则，使用作业级别的拓扑逻辑（原有代码）
+    jobStmtsByTier := make(map[int]map[string]*framework.Statement)
+    hyperNodesWithLeftTasks := make(map[string]*util.PriorityQueue)
+    ssn := alloc.session
+    selectedTier := 0
+    LCAHyperNodeMap := map[string]string{}
+    jobAllocatedHyperNode := job.PodGroup.Annotations[api.JobAllocatedHyperNode]
 
-	// Find a suitable hyperNode in one tier from down to top everytime to ensure that the selected hyperNode spans the least tier.
+    // 原有逻辑保持不变...
+    // Find a suitable hyperNode in one tier from down to top everytime to ensure that the selected hyperNode spans the least tier.
 	for _, tier := range ssn.HyperNodesTiers {
 		if tier > highestAllowedTier {
 			klog.V(4).ErrorS(nil, "Skip search for higher tier cause highest allowed tier reached", "jobName", job.UID, "highestAllowedTier", highestAllowedTier, "tier", tier)
@@ -297,7 +378,7 @@ func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQu
 			job.PodGroup.GetAnnotations()[api.JobAllocatedHyperNode] = jobNewHyperNode
 		}
 	}
-	return stmt, hyperNodesWithLeftTasks[hyperNode]
+    return stmt, hyperNodesWithLeftTasks[hyperNode]
 }
 
 // selectBestStmt return a stmt and best hyperNode related to the stmt, it will
@@ -354,80 +435,114 @@ func (alloc *Action) selectBestHyperNode(jobStmts map[string]*framework.Statemen
 }
 
 func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, allNodes []*api.NodeInfo, hyperNode string) *framework.Statement {
-	ssn := alloc.session
-	stmt := framework.NewStatement(ssn)
-	ph := util.NewPredicateHelper()
-	// For TopologyNetworkSoftMode
-	jobNewAllocatedHyperNode := job.PodGroup.GetAnnotations()[api.JobAllocatedHyperNode]
+    ssn := alloc.session
+    stmt := framework.NewStatement(ssn)
+    ph := util.NewPredicateHelper()
+    // For TopologyNetworkSoftMode
+    jobNewAllocatedHyperNode := job.PodGroup.GetAnnotations()[api.JobAllocatedHyperNode]
+    
+    // 创建一个map来跟踪每个任务的拓扑要求
+    taskTopologyMap := make(map[api.TaskID]string)
+    
+    for !tasks.Empty() {
+        task := tasks.Pop().(*api.TaskInfo)
+        if !ssn.Allocatable(queue, task) {
+            klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
+            continue
+        }
 
-	for !tasks.Empty() {
-		task := tasks.Pop().(*api.TaskInfo)
-		if !ssn.Allocatable(queue, task) {
-			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
-			continue
-		}
+        // check if the task with its spec has already predicates failed
+        if job.TaskHasFitErrors(task) {
+            klog.V(5).Infof("Task %s with role spec %s has already predicated failed, skip", task.Name, task.TaskRole)
+            continue
+        }
 
-		// check if the task with its spec has already predicates failed
-		if job.TaskHasFitErrors(task) {
-			klog.V(5).Infof("Task %s with role spec %s has already predicated failed, skip", task.Name, task.TaskRole)
-			continue
-		}
+        klog.V(3).Infof("There are <%d> nodes for Job <%v/%v>", len(ssn.Nodes), job.Namespace, job.Name)
 
-		klog.V(3).Infof("There are <%d> nodes for Job <%v/%v>", len(ssn.Nodes), job.Namespace, job.Name)
+        if err := ssn.PrePredicateFn(task); err != nil {
+            klog.V(3).Infof("PrePredicate for task %s/%s failed for: %v", task.Namespace, task.Name, err)
+            fitErrors := api.NewFitErrors()
+            for _, ni := range allNodes {
+                fitErrors.SetNodeError(ni.Name, err)
+            }
+            job.NodesFitErrors[task.UID] = fitErrors
+            break
+        }
+        
+        // 检查任务级别的拓扑要求
+        var nodesForTask []*api.NodeInfo
+        hardMode, highestAllowedTier := alloc.getTaskTopologyMode(task)
+        
+        if hardMode && task.TaskTopologyHyperNode != "" {
+            // 对于有明确拓扑要求的任务，只选择特定的hyperNode中的节点
+            hyperNodeName := task.TaskTopologyHyperNode
+            if nodes, ok := ssn.RealNodesList[hyperNodeName]; ok {
+                nodesForTask = nodes
+            } else {
+                klog.V(4).InfoS("Task specified hyperNode not found", "task", task.Name, "hyperNode", hyperNodeName)
+                continue
+            }
+        } else {
+            // 对于没有明确拓扑要求的任务，使用所有可用节点
+            nodesForTask = allNodes
+        }
 
-		if err := ssn.PrePredicateFn(task); err != nil {
-			klog.V(3).Infof("PrePredicate for task %s/%s failed for: %v", task.Namespace, task.Name, err)
-			fitErrors := api.NewFitErrors()
-			for _, ni := range allNodes {
-				fitErrors.SetNodeError(ni.Name, err)
-			}
-			job.NodesFitErrors[task.UID] = fitErrors
-			break
-		}
+        predicateNodes, fitErrors := ph.PredicateNodes(task, nodesForTask, alloc.predicate, alloc.enablePredicateErrorCache)
+        if len(predicateNodes) == 0 {
+            job.NodesFitErrors[task.UID] = fitErrors
+            // Assume that all left tasks are allocatable, but can not meet gang-scheduling min member,
+            // so we should break from continuously allocating.
+            // otherwise, should continue to find other allocatable task
+            if job.NeedContinueAllocating() {
+                continue
+            } else {
+                break
+            }
+        }
 
-		predicateNodes, fitErrors := ph.PredicateNodes(task, allNodes, alloc.predicate, alloc.enablePredicateErrorCache)
-		if len(predicateNodes) == 0 {
-			job.NodesFitErrors[task.UID] = fitErrors
-			// Assume that all left tasks are allocatable, but can not meet gang-scheduling min member,
-			// so we should break from continuously allocating.
-			// otherwise, should continue to find other allocatable task
-			if job.NeedContinueAllocating() {
-				continue
-			} else {
-				break
-			}
-		}
+        if job.IsSoftTopologyMode() {
+            task.JobAllocatedHyperNode = jobNewAllocatedHyperNode
+        }
 
-		if job.IsSoftTopologyMode() {
-			task.JobAllocatedHyperNode = jobNewAllocatedHyperNode
-		}
+        bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
+        if bestNode == nil {
+            continue
+        }
 
-		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
-		if bestNode == nil {
-			continue
-		}
+        // 记录任务被分配到的hyperNode
+        if hyperNode == "" {
+            // 如果不是在特定hyperNode的上下文中，计算节点所属的hyperNode
+            nodeHyperNode := util.FindHyperNodeForNode(bestNode.Name, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+            if nodeHyperNode != "" {
+                taskTopologyMap[task.UID] = nodeHyperNode
+                alloc.sumNodeScoresInHyperNode(string(job.UID), nodeHyperNode, highestScore)
+            }
+        } else {
+            alloc.sumNodeScoresInHyperNode(string(job.UID), hyperNode, highestScore)
+            taskTopologyMap[task.UID] = hyperNode
+        }
 
-		alloc.sumNodeScoresInHyperNode(string(job.UID), hyperNode, highestScore)
+        if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err == nil {
+            jobNewAllocatedHyperNode = getJobNewAllocatedHyperNode(ssn, bestNode.Name, job, jobNewAllocatedHyperNode)
+            // 更新任务的拓扑分配信息
+            task.AllocatedHyperNode = taskTopologyMap[task.UID]
+        }
 
-		if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err == nil {
-			jobNewAllocatedHyperNode = getJobNewAllocatedHyperNode(ssn, bestNode.Name, job, jobNewAllocatedHyperNode)
-		}
+        if ssn.JobReady(job) && !tasks.Empty() {
+            break
+        }
+    }
 
-		if ssn.JobReady(job) && !tasks.Empty() {
-			break
-		}
-	}
-
-	if ssn.JobReady(job) {
-		klog.V(3).InfoS("Job ready, return statement", "jobName", job.UID)
-		updateJobAllocatedHyperNode(job, jobNewAllocatedHyperNode)
-		return stmt
-	} else {
-		if !ssn.JobPipelined(job) {
-			stmt.Discard()
-		}
-		return nil
-	}
+    if ssn.JobReady(job) {
+        klog.V(3).InfoS("Job ready, return statement", "jobName", job.UID)
+        updateJobAllocatedHyperNode(job, jobNewAllocatedHyperNode)
+        return stmt
+    } else {
+        if !ssn.JobPipelined(job) {
+            stmt.Discard()
+        }
+        return nil
+    }
 }
 
 // getJobNewAllocatedHyperNode Obtain the newly allocated hyperNode for the job in soft topology mode
@@ -571,3 +686,24 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 }
 
 func (alloc *Action) UnInitialize() {}
+
+
+func (alloc *Action) getTaskTopologyMode(task *api.TaskInfo) (bool, int) {
+    // 检查任务是否有指定的拓扑模式
+    if task.TaskTopologyMode == "" {
+        // 如果任务没有指定拓扑模式，返回默认值
+        return false, 0
+    }
+    
+    // 解析任务的拓扑模式
+    if task.TaskTopologyMode == api.HardTopologyMode {
+        // 返回硬模式和最高允许层级
+        return true, task.TaskTopologyHighestTier
+    } else if task.TaskTopologyMode == api.SoftTopologyMode {
+        // 返回软模式标志
+        return false, task.TaskTopologyHighestTier
+    }
+    
+    // 默认返回非拓扑模式
+    return false, 0
+}
