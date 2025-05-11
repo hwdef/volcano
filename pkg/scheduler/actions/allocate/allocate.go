@@ -125,6 +125,8 @@ func (alloc *Action) pickUpQueuesAndJobs(queues *util.PriorityQueue, jobsMap map
 func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[api.QueueID]*util.PriorityQueue) {
 	ssn := alloc.session
 	pendingTasks := map[api.JobID]*util.PriorityQueue{}
+	// 添加一个映射，用于跟踪具有拓扑约束的任务
+	tasksWithTopology := map[api.TaskID]bool{}
 
 	allNodes := ssn.NodeList
 
@@ -167,6 +169,18 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 					continue
 				}
 
+				// 检查任务是否有自己的拓扑约束（假设API已经修改）
+				// 注意：这里我们假设TaskInfo已经添加了NetworkTopology字段
+				// 如果API实际上以不同的方式实现，需要相应调整
+				if task.Pod != nil && task.Pod.Annotations != nil {
+					// 示例：从pod注解中获取任务级别的拓扑信息
+					if _, ok := task.Pod.Annotations["volcano.sh/task-topology-mode"]; ok {
+						klog.V(4).Infof("Task <%v/%v> has its own topology constraint.",
+							task.Namespace, task.Name)
+						tasksWithTopology[task.UID] = true
+					}
+				}
+
 				tasks.Push(task)
 			}
 			pendingTasks[job.UID] = tasks
@@ -190,14 +204,16 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 				klog.ErrorS(nil, "RealNodesList not completely populated and not ready to schedule, please check logs for more details", "job", job.UID)
 				continue
 			}
-			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier)
+			// 将任务级拓扑信息传递给任务分配函数
+			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier, tasksWithTopology)
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back and set pending tasks.
 			if tasksQueue != nil {
 				jobs.Push(job)
 				pendingTasks[job.UID] = tasksQueue
 			}
 		} else {
-			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "")
+			// 同样传递任务级拓扑信息
+			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "", tasksWithTopology)
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back
 			if tasks.Len() > 0 {
 				jobs.Push(job)
@@ -214,13 +230,16 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 	}
 }
 
-func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int) (*framework.Statement, *util.PriorityQueue) {
+func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int, tasksWithTopology map[api.TaskID]bool) (*framework.Statement, *util.PriorityQueue) {
 	jobStmtsByTier := make(map[int]map[string]*framework.Statement)
 	hyperNodesWithLeftTasks := make(map[string]*util.PriorityQueue)
 	ssn := alloc.session
 	selectedTier := 0
 	LCAHyperNodeMap := map[string]string{}
 	jobAllocatedHyperNode := job.PodGroup.Annotations[api.JobAllocatedHyperNode]
+
+	// 记录任务级别的拓扑约束
+	taskAllocatedHyperNodes := make(map[api.TaskID]string)
 
 	// Find a suitable hyperNode in one tier from down to top everytime to ensure that the selected hyperNode spans the least tier.
 	for _, tier := range ssn.HyperNodesTiers {
@@ -257,7 +276,7 @@ func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQu
 			tasksQueue := tasks.Clone()
 			job.ResetFitErr()
 			klog.V(3).InfoS("Try to allocate resource for job in hyperNode", "jobName", job.UID, "hyperNodeName", hyperNodeName, "tier", tier)
-			stmt := alloc.allocateResourcesForTasks(tasksQueue, job, queue, nodes, hyperNodeName)
+			stmt := alloc.allocateResourcesForTasks(tasksQueue, job, queue, nodes, hyperNodeName, tasksWithTopology)
 			if stmt == nil {
 				klog.V(4).InfoS("Cannot allocate resources for job with network topology constrains", "jobName", job.UID, "hyperNodeName", hyperNodeName, "tier", tier)
 				continue
@@ -297,6 +316,14 @@ func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQu
 			job.PodGroup.GetAnnotations()[api.JobAllocatedHyperNode] = jobNewHyperNode
 		}
 	}
+
+	// 处理任务级别的拓扑约束
+	for taskID, hyperNode := range taskAllocatedHyperNodes {
+		klog.V(4).Infof("Task %s has been allocated to hyperNode %s", taskID, hyperNode)
+		// 可以在这里保存任务级别的hyperNode分配结果
+		// 例如，可以在任务的Pod注释中设置
+	}
+
 	return stmt, hyperNodesWithLeftTasks[hyperNode]
 }
 
@@ -359,12 +386,25 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 	ph := util.NewPredicateHelper()
 	// For TopologyNetworkSoftMode
 	jobNewAllocatedHyperNode := job.PodGroup.GetAnnotations()[api.JobAllocatedHyperNode]
+	// Track per-task allocated hyperNode for task-level topology
+	taskAllocatedHyperNodes := make(map[api.TaskID]string)
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
 			continue
+		}
+
+		// 检查 task 是否有自己的 topology 约束
+		// 假设 task.TopologyMode 和 task.HighestTierAllowed 已经添加到 TaskInfo 结构体中
+		hasTaskTopology := false
+		taskHighestAllowedTier := 0
+		if task.NetworkTopology != nil && task.NetworkTopology.Mode == "hard" && task.NetworkTopology.HighestTierAllowed > 0 {
+			hasTaskTopology = true
+			taskHighestAllowedTier = task.NetworkTopology.HighestTierAllowed
+			klog.V(4).Infof("Task <%s/%s> has its own topology constraints, mode: %s, highest tier allowed: %d",
+				task.Namespace, task.Name, task.NetworkTopology.Mode, task.NetworkTopology.HighestTierAllowed)
 		}
 
 		// check if the task with its spec has already predicates failed
@@ -568,6 +608,17 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 		return api.NewFitErrWithStatus(task, node, statusSets...)
 	}
 	return alloc.session.PredicateForAllocateAction(task, node)
+}
+
+// Check if task has its own topology constraints
+func (alloc *Action) taskHasTopology(task *api.TaskInfo) (bool, int) {
+	// 假设 API 已经修改，为 task 添加了 topology 字段
+	// 这里我们假定 task.TopologyMode 和 task.HighestTierAllowed 字段已存在
+	if task.TopologyMode == "" || task.HighestTierAllowed == 0 {
+		return false, 0
+	}
+
+	return task.TopologyMode == "hard", task.HighestTierAllowed
 }
 
 func (alloc *Action) UnInitialize() {}

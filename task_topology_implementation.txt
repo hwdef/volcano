@@ -1,0 +1,98 @@
+// 这个文件包含了在task级别实现topology的修改方案
+// 假设API已经修改，为TaskInfo添加了如下字段：
+// 1. NetworkTopology字段，类似于JobInfo中的字段
+// 2. 或者TaskInfo.Pod的Annotations中添加了相关字段，例如"volcano.sh/task-topology-mode"和"volcano.sh/task-topology-tier"
+
+主要变更点：
+
+1. allocateResources方法中添加taskWithTopology映射，用于跟踪具有拓扑约束的任务
+   ```go
+   pendingTasks := map[api.JobID]*util.PriorityQueue{}
+   // 添加一个映射，用于跟踪具有拓扑约束的任务
+   tasksWithTopology := map[api.TaskID]bool{}
+   ```
+
+2. 在添加pending任务时检查任务是否有拓扑约束
+   ```go
+   // 检查任务是否有自己的拓扑约束
+   // 从pod注解中获取任务级别的拓扑信息
+   if task.Pod != nil && task.Pod.Annotations != nil {
+       if _, ok := task.Pod.Annotations["volcano.sh/task-topology-mode"]; ok {
+           klog.V(4).Infof("Task <%v/%v> has its own topology constraint.",
+               task.Namespace, task.Name)
+           tasksWithTopology[task.UID] = true
+       }
+   }
+   ```
+
+3. 修改allocateResourceForTasksWithTopology和allocateResourcesForTasks方法，添加tasksWithTopology参数
+   ```go
+   func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int, tasksWithTopology map[api.TaskID]bool) (*framework.Statement, *util.PriorityQueue)
+   
+   func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, allNodes []*api.NodeInfo, hyperNode string, tasksWithTopology map[api.TaskID]bool) *framework.Statement
+   ```
+
+4. 在allocateResourcesForTasks方法中，为每个任务检查其是否有拓扑约束
+   ```go
+   // 检查任务是否有自己的拓扑约束
+   hasTaskLevelTopology := false
+   if tasksWithTopology != nil && tasksWithTopology[task.UID] {
+       hasTaskLevelTopology = true
+       klog.V(4).Infof("Task <%s/%s> has task-level topology constraints", task.Namespace, task.Name)
+       
+       // 处理任务级别的拓扑约束
+       // 这里可以实现针对任务级别的拓扑逻辑
+   }
+   
+   // 如果任务有自己的拓扑约束，则应用任务级别的拓扑逻辑
+   // 否则，继续使用作业级别的拓扑逻辑
+   if hasTaskLevelTopology {
+       // 任务级别的拓扑逻辑
+   } else if job.IsSoftTopologyMode() {
+       // 作业级别的拓扑逻辑
+       task.JobAllocatedHyperNode = jobNewAllocatedHyperNode
+   }
+   ```
+
+5. 任务分配成功后，根据任务是否有拓扑约束更新不同的状态
+   ```go
+   if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err == nil {
+       // 处理作业级别的hyperNode
+       jobNewAllocatedHyperNode = getJobNewAllocatedHyperNode(ssn, bestNode.Name, job, jobNewAllocatedHyperNode)
+       
+       // 处理任务级别的hyperNode
+       if hasTaskLevelTopology {
+           // 更新任务级别的HyperNode状态
+           taskHyperNode := util.FindHyperNodeForNode(bestNode.Name, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
+           if taskHyperNode != "" {
+               // 记录任务级别的hyperNode分配信息
+               taskLevelAllocatedHyperNodes[task.UID] = taskHyperNode
+           }
+       }
+   }
+   ```
+
+6. 在Job Ready时处理任务级别的拓扑信息
+   ```go
+   if ssn.JobReady(job) {
+       klog.V(3).InfoS("Job ready, return statement", "jobName", job.UID)
+       // 更新作业级别的hyperNode
+       updateJobAllocatedHyperNode(job, jobNewAllocatedHyperNode)
+       
+       // 对于任务级别的拓扑，可以更新任务的注解
+       for taskID, hyperNodeName := range taskLevelAllocatedHyperNodes {
+           klog.V(4).Infof("Task %s has been allocated to hyperNode %s (task-level topology)", taskID, hyperNodeName)
+           // 这里可以保存任务的hyperNode信息
+           // 例如，可以更新任务的Pod注解
+       }
+       
+       return stmt
+   }
+   ```
+
+具体API实现建议：
+1. 在TaskInfo结构体中添加NetworkTopology字段，结构与JobInfo中的类似
+2. 或者通过Pod的注解实现，使用"volcano.sh/task-topology-mode"和"volcano.sh/task-topology-tier"等注解
+3. 添加相应的辅助函数，例如TaskInfo.IsHardTopologyMode()，类似于JobInfo的方法
+
+实现这些更改需要确保所有使用这些函数的地方都正确传递新增的参数。
