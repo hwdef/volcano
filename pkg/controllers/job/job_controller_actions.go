@@ -759,13 +759,24 @@ func (cc *jobcontroller) createOrUpdatePodGroup(job *batch.Job) error {
 			},
 		}
 		if job.Spec.NetworkTopology != nil {
-			nt := &scheduling.NetworkTopologySpec{
-				Mode: scheduling.NetworkTopologyMode(job.Spec.NetworkTopology.Mode),
+			pg.Spec.NetworkTopology = convertBatchNtToSchedulingNt(job.Spec.NetworkTopology)
+		} else {
+			// avoid set job network topology and task network topology at the same time
+			taskNetworkTopology := []scheduling.PodsNetworkTopologySpec{}
+
+			for _, task := range job.Spec.Tasks {
+				if task.NetworkTopology != nil {
+					nt := convertBatchNtToSchedulingNt(task.NetworkTopology)
+					taskNetworkTopology = append(taskNetworkTopology, scheduling.PodsNetworkTopologySpec{
+						TaskName:        &task.Name,
+						NetworkTopology: nt,
+					})
+				}
 			}
-			if job.Spec.NetworkTopology.HighestTierAllowed != nil {
-				nt.HighestTierAllowed = job.Spec.NetworkTopology.HighestTierAllowed
+
+			if len(taskNetworkTopology) > 0 {
+				pg.Spec.PodsNetworkTopology = taskNetworkTopology
 			}
-			pg.Spec.NetworkTopology = nt
 		}
 
 		if _, err = cc.vcClient.SchedulingV1beta1().PodGroups(job.Namespace).Create(context.TODO(), pg, metav1.CreateOptions{}); err != nil {

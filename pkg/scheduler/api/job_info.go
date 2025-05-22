@@ -39,6 +39,11 @@ import (
 	volumescheduling "volcano.sh/volcano/pkg/scheduler/capabilities/volumebinding"
 )
 
+const (
+	HardTopo = "hard"
+	SoftTopo = "soft"
+)
+
 // DisruptionBudget define job min pod available and max pod unavailable value
 type DisruptionBudget struct {
 	MinAvailable  string
@@ -1075,4 +1080,18 @@ func (ji *JobInfo) IsSoftTopologyMode() bool {
 func (ji *JobInfo) ResetFitErr() {
 	ji.JobFitErrors = ""
 	ji.NodesFitErrors = make(map[TaskID]*FitErrors)
+}
+
+// IsHardTopologyMode return whether the task's network topology mode is hard and also return the highest allowed tier
+func (ji *JobInfo) TaskIsHardTopologyMode(taskRole string) (bool, int) {
+	if ji.PodGroup == nil {
+		return false, 0
+	}
+	for _, podsNetworkTopology := range ji.PodGroup.Spec.PodsNetworkTopology {
+		if *podsNetworkTopology.TaskName == taskRole && podsNetworkTopology.NetworkTopology != nil {
+			return podsNetworkTopology.NetworkTopology.Mode == scheduling.HardNetworkTopologyMode,
+				*podsNetworkTopology.NetworkTopology.HighestTierAllowed
+		}
+	}
+	return false, 0
 }

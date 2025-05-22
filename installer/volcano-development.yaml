@@ -411,6 +411,18 @@ spec:
                       type: integer
                     name:
                       type: string
+                    networkTopology:
+                      properties:
+                        highestTierAllowed:
+                          default: 1
+                          type: integer
+                        mode:
+                          default: hard
+                          enum:
+                          - hard
+                          - soft
+                          type: string
+                      type: object
                     policies:
                       items:
                         properties:
@@ -4844,6 +4856,85 @@ spec:
                     - soft
                     type: string
                 type: object
+              podsNetworkTopology:
+                description: |-
+                  PodsNetworkTopology defines the NetworkTopology config for Some set of pods,
+                  such as task of vcjob, this field works in conjunction with network topology feature and hyperNode CRD.
+                items:
+                  description: PodsetNetworkTopologySpec represents the correspondence
+                    between a set of pods and networktopology
+                  properties:
+                    labelMatch:
+                      description: Selector defines the selection rules for a set
+                        of pods. For non-vcjob task level network topology, this field
+                        is required.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    networkTopology:
+                      description: NetworkTopology defines network topology.
+                      properties:
+                        highestTierAllowed:
+                          default: 1
+                          description: HighestTierAllowed specifies the highest tier
+                            that a job allowed to cross when scheduling.
+                          type: integer
+                        mode:
+                          default: hard
+                          description: Mode specifies the mode of the network topology
+                            constrain.
+                          enum:
+                          - hard
+                          - soft
+                          type: string
+                      type: object
+                    taskName:
+                      description: TaskName defines the name of task in vcjob, only
+                        for vcjob task level network topology.
+                      type: string
+                  type: object
+                type: array
               priorityClassName:
                 description: |-
                   If specified, indicates the PodGroup's priority. "system-node-critical" and
@@ -5881,6 +5972,18 @@ spec:
                       type: integer
                     name:
                       type: string
+                    networkTopology:
+                      properties:
+                        highestTierAllowed:
+                          default: 1
+                          type: integer
+                        mode:
+                          default: hard
+                          enum:
+                          - hard
+                          - soft
+                          type: string
+                      type: object
                     policies:
                       items:
                         properties:

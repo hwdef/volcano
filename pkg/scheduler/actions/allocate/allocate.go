@@ -124,7 +124,7 @@ func (alloc *Action) pickUpQueuesAndJobs(queues *util.PriorityQueue, jobsMap map
 // 2. allocates resources to these tasks. (this step is carried out by the allocateResourcesForTasks method.)
 func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[api.QueueID]*util.PriorityQueue) {
 	ssn := alloc.session
-	pendingTasks := map[api.JobID]*util.PriorityQueue{}
+	pendingTasks := map[api.JobID]map[string]*util.PriorityQueue{} // jobId -> taskTopoMode -> taskQueue
 
 	allNodes := ssn.NodeList
 
@@ -153,7 +153,8 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 
 		job := jobs.Pop().(*api.JobInfo)
 		if _, found = pendingTasks[job.UID]; !found {
-			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+			hardTopologyTasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+			normalTasks := util.NewPriorityQueue(ssn.TaskOrderFn)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
 				// Skip tasks whose pod are scheduling gated
 				if task.SchGated {
@@ -167,39 +168,52 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 					continue
 				}
 
-				tasks.Push(task)
+				// tasks.Push(task)
+				jobHardMode, _ := job.IsHardTopologyMode()
+				taskHardMode, _ := job.TaskIsHardTopologyMode(task.TaskRole)
+				if jobHardMode || taskHardMode {
+					hardTopologyTasks.Push(task)
+				} else {
+					normalTasks.Push(task)
+				}
+
 			}
-			pendingTasks[job.UID] = tasks
+			pendingTasks[job.UID] = map[string]*util.PriorityQueue{
+				api.HardTopo: hardTopologyTasks,
+				api.SoftTopo: normalTasks,
+			}
 		}
 		tasks := pendingTasks[job.UID]
 
-		if tasks.Empty() {
+		if tasks[api.HardTopo].Empty() && tasks[api.SoftTopo].Empty() {
 			// put queue back again and try other jobs in this queue
 			queues.Push(queue)
 			continue
 		}
 
 		klog.V(3).Infof("Try to allocate resource to %d tasks of Job <%v/%v>",
-			tasks.Len(), job.Namespace, job.Name)
-
-		hardMode, highestAllowedTier := job.IsHardTopologyMode()
+			tasks[api.HardTopo].Len()+tasks[api.SoftTopo].Len(), job.Namespace, job.Name)
 		var stmt *framework.Statement
 		var tasksQueue *util.PriorityQueue
-		if hardMode {
+
+		if !tasks[api.HardTopo].Empty() {
 			if !alloc.session.HyperNodesReadyToSchedule {
 				klog.ErrorS(nil, "RealNodesList not completely populated and not ready to schedule, please check logs for more details", "job", job.UID)
 				continue
 			}
-			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier)
+
+			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks[api.HardTopo], job, queue)
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back and set pending tasks.
 			if tasksQueue != nil {
 				jobs.Push(job)
-				pendingTasks[job.UID] = tasksQueue
+				pendingTasks[job.UID][api.HardTopo] = tasksQueue
 			}
-		} else {
-			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "")
+		}
+
+		if !tasks[api.SoftTopo].Empty() {
+			stmt = alloc.allocateResourcesForTasks(tasks[api.SoftTopo], job, queue, allNodes, "")
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back
-			if tasks.Len() > 0 {
+			if tasks[api.SoftTopo].Len() > 0 {
 				jobs.Push(job)
 			}
 		}

@@ -30,7 +30,7 @@ import (
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	"volcano.sh/apis/pkg/apis/helpers"
-	schedulingv2 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
@@ -111,7 +111,7 @@ func createJobPod(job *batch.Job, template *v1.PodTemplateSpec, topologyPolicy b
 	pod.Annotations[batch.TaskIndex] = index
 	pod.Annotations[batch.TaskSpecKey] = tsKey
 	pgName := job.Name + "-" + string(job.UID)
-	pod.Annotations[schedulingv2.KubeGroupNameAnnotationKey] = pgName
+	pod.Annotations[scheduling.KubeGroupNameAnnotationKey] = pgName
 	pod.Annotations[batch.JobNameKey] = job.Name
 	pod.Annotations[batch.QueueNameKey] = job.Spec.Queue
 	pod.Annotations[batch.JobVersion] = fmt.Sprintf("%d", job.Status.Version)
@@ -119,24 +119,24 @@ func createJobPod(job *batch.Job, template *v1.PodTemplateSpec, topologyPolicy b
 	pod.Annotations[batch.JobRetryCountKey] = strconv.Itoa(int(job.Status.RetryCount))
 
 	if topologyPolicy != "" {
-		pod.Annotations[schedulingv2.NumaPolicyKey] = string(topologyPolicy)
+		pod.Annotations[scheduling.NumaPolicyKey] = string(topologyPolicy)
 	}
 
 	if len(job.Annotations) > 0 {
-		if value, found := job.Annotations[schedulingv2.PodPreemptable]; found {
-			pod.Annotations[schedulingv2.PodPreemptable] = value
+		if value, found := job.Annotations[scheduling.PodPreemptable]; found {
+			pod.Annotations[scheduling.PodPreemptable] = value
 		}
-		if value, found := job.Annotations[schedulingv2.CooldownTime]; found {
-			pod.Annotations[schedulingv2.CooldownTime] = value
+		if value, found := job.Annotations[scheduling.CooldownTime]; found {
+			pod.Annotations[scheduling.CooldownTime] = value
 		}
-		if value, found := job.Annotations[schedulingv2.RevocableZone]; found {
-			pod.Annotations[schedulingv2.RevocableZone] = value
+		if value, found := job.Annotations[scheduling.RevocableZone]; found {
+			pod.Annotations[scheduling.RevocableZone] = value
 		}
 
-		if value, found := job.Annotations[schedulingv2.JDBMinAvailable]; found {
-			pod.Annotations[schedulingv2.JDBMinAvailable] = value
-		} else if value, found := job.Annotations[schedulingv2.JDBMaxUnavailable]; found {
-			pod.Annotations[schedulingv2.JDBMaxUnavailable] = value
+		if value, found := job.Annotations[scheduling.JDBMinAvailable]; found {
+			pod.Annotations[scheduling.JDBMinAvailable] = value
+		} else if value, found := job.Annotations[scheduling.JDBMaxUnavailable]; found {
+			pod.Annotations[scheduling.JDBMaxUnavailable] = value
 		}
 	}
 
@@ -151,11 +151,11 @@ func createJobPod(job *batch.Job, template *v1.PodTemplateSpec, topologyPolicy b
 	pod.Labels[batch.JobNamespaceKey] = job.Namespace
 	pod.Labels[batch.QueueNameKey] = job.Spec.Queue
 	if len(job.Labels) > 0 {
-		if value, found := job.Labels[schedulingv2.PodPreemptable]; found {
-			pod.Labels[schedulingv2.PodPreemptable] = value
+		if value, found := job.Labels[scheduling.PodPreemptable]; found {
+			pod.Labels[scheduling.PodPreemptable] = value
 		}
-		if value, found := job.Labels[schedulingv2.CooldownTime]; found {
-			pod.Labels[schedulingv2.CooldownTime] = value
+		if value, found := job.Labels[scheduling.CooldownTime]; found {
+			pod.Labels[scheduling.CooldownTime] = value
 		}
 	}
 
@@ -460,4 +460,14 @@ func GetActionType(action v1alpha1.Action) ActionType {
 		return PodAction
 	}
 	return JobAction
+}
+
+func convertBatchNtToSchedulingNt(batchNt *batch.NetworkTopologySpec) *scheduling.NetworkTopologySpec {
+	nt := &scheduling.NetworkTopologySpec{
+		Mode: scheduling.NetworkTopologyMode(batchNt.Mode),
+	}
+	if batchNt.HighestTierAllowed != nil {
+		nt.HighestTierAllowed = batchNt.HighestTierAllowed
+	}
+	return nt
 }

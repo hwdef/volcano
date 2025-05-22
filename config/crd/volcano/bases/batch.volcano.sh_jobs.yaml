@@ -145,6 +145,18 @@ spec:
                       type: integer
                     name:
                       type: string
+                    networkTopology:
+                      properties:
+                        highestTierAllowed:
+                          default: 1
+                          type: integer
+                        mode:
+                          default: hard
+                          enum:
+                          - hard
+                          - soft
+                          type: string
+                      type: object
                     policies:
                       items:
                         properties:
